@@ -31,6 +31,18 @@ import { McpToolRegistrationError, syncTools } from './tools.ts'
 import type { ToolDisposers } from './tools.ts'
 import type { Config } from './index.ts'
 
+/**
+ * Budget for the modern-protocol `server/discover` probe, in milliseconds.
+ *
+ * The probe is one small round trip: a server that speaks the modern era answers
+ * it instantly, and a legacy server answers `-32601` instantly too. Only a server
+ * that silently drops unknown methods makes the probe wait, and without a bound
+ * it would wait the client's full request timeout (60s) before the legacy
+ * fallback — a stall on every connect attempt. Silence therefore resolves to
+ * "legacy" after this budget, and the legacy handshake proceeds normally.
+ */
+const MCP_NEGOTIATION_PROBE_TIMEOUT_MS = 5_000
+
 /** Automatic reconnect policy for one MCP server connection. */
 export interface ReconnectConfig {
   /** Reconnect automatically after a lost connection (default true). */
@@ -282,7 +294,14 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
   async function connectGeneration(): Promise<void> {
     if (isStopped()) return
     const client = new Client({ name: 'dsh-mcp-client', version: '0.0.1' }, {
-      capabilities: {}, versionNegotiation: { mode: 'auto' },
+      capabilities: {},
+      // Protocol negotiation probes the modern `server/discover` request first. A
+      // 2025-era server that replies `-32601` is demoted to the legacy handshake
+      // immediately, but one that ignores unknown methods answers nothing at all,
+      // and the probe would then inherit the client's 60s request timeout — the
+      // whole connection sits on it, and host startup with it. Bound the probe:
+      // silence means "legacy", and the legacy handshake still succeeds.
+      versionNegotiation: { mode: 'auto', probe: { timeoutMs: MCP_NEGOTIATION_PROBE_TIMEOUT_MS } },
       listChanged: { tools: { autoRefresh: false, debounceMs: 0, onChanged: () => { void refreshTools() } } },
     })
     const record: Generation = { wire: new McpGeneration(client, config.closeTimeoutMs, error => diagnostic(error, 'cleanup')) }
